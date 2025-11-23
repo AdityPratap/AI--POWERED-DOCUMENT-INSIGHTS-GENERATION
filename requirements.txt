@@ -1,8 +1,9 @@
 streamlit==1.39.0
-sentence-transformers==2.7.0
-transformers==4.44.2
-torch
 numpy
-faiss-cpu
-pymupdf
+pymupdf==1.24.10
 python-docx
+sentence-transformers==2.5.1
+transformers==4.38.2
+torch==2.1.0+cpu
+--extra-index-url https://download.pytorch.org/whl/cpu
+accelerate
