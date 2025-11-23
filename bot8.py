@@ -1,253 +1,256 @@
-# bot8.py — Ultra-Fast PDF & DOCX Insight Generator
+# bot8.py — Free / Lightweight PDF & DOCX Insight Generator (No API keys)
 import os
 os.environ.setdefault("STREAMLIT_SERVER_FILE_WATCHER_TYPE", "none")
 
 import io
 import re
-from typing import List, Tuple
+from typing import List, Tuple, Dict
 
 import numpy as np
 import streamlit as st
-import fitz  # PyMuPDF (⚡Super-fast PDF extraction)
+import fitz  # PyMuPDF
 import docx
 
-# FAISS (optional)
-try:
-    import faiss  # type: ignore
-    HAVE_FAISS = True
-except Exception:
-    HAVE_FAISS = False
+# Lightweight NLP & summarization
+import nltk
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
+from sumy.parsers.plaintext import PlaintextParser
+from sumy.nlp.tokenizers import Tokenizer
+from sumy.summarizers.lex_rank import LexRankSummarizer
 
-from sentence_transformers import SentenceTransformer
-from transformers import pipeline
+# Ensure NLTK punkt is available (quiet)
+nltk.download("punkt", quiet=True)
 
 # =============================
-# Streamlit UI Config
+# Streamlit config & styles
 # =============================
-st.set_page_config(page_title="AI Document Insight Generator", page_icon="📄", layout="wide")
-
+st.set_page_config(page_title="Doc Insight (Free)", page_icon="📄", layout="wide")
 st.markdown(
     """
     <style>
     html, body, [class*="css"] { font-size: 15px; }
-    h1 { font-size: 1.6rem; }
-    h2 { font-size: 1.3rem; }
+    h1 { font-size: 1.5rem; }
     .muted { color: #6b7280; }
-    .card { padding: 1rem; border: 1px solid #eee; border-radius: 14px; box-shadow: 0 1px 3px rgba(0,0,0,.06); background: #fff; }
+    .card { padding: 0.9rem; border: 1px solid #eee; border-radius: 10px; background: #fff; }
     </style>
     """,
     unsafe_allow_html=True,
 )
 
 # =============================
-# Load ML Models (cached)
-# =============================
-@st.cache_resource(show_spinner=False)
-def get_embedder():
-    return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-
-@st.cache_resource(show_spinner=False)
-def get_summarizer():
-    # 3× faster than bart-large-cnn
-    return pipeline("summarization", model="sshleifer/distilbart-cnn-12-6")
-
-# =============================
-# FAST TEXT EXTRACTION
+# Utilities: extraction & chunking
 # =============================
 def extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
     """Fast PDF extraction using PyMuPDF."""
-    text_parts = []
-    pdf = fitz.open(stream=file_bytes, filetype="pdf")
+    try:
+        pdf = fitz.open(stream=file_bytes, filetype="pdf")
+    except Exception:
+        return ""
+    parts = []
     for page in pdf:
-        page_text = page.get_text("text")
-        page_text = re.sub(r"\s+", " ", page_text).strip()
-        if page_text:
-            text_parts.append(page_text)
-    return "\n\n".join(text_parts)
+        txt = page.get_text("text") or ""
+        txt = re.sub(r"\s+", " ", txt).strip()
+        if txt:
+            parts.append(txt)
+    return "\n\n".join(parts)
 
 def extract_text_from_docx(file_bytes: bytes) -> str:
-    doc = docx.Document(io.BytesIO(file_bytes))
-    return "\n".join([p.text.strip() for p in doc.paragraphs if p.text.strip()])
+    try:
+        doc = docx.Document(io.BytesIO(file_bytes))
+    except Exception:
+        return ""
+    paragraphs = [p.text.strip() for p in doc.paragraphs if p.text.strip()]
+    return "\n".join(paragraphs)
+
+def chunk_text(text: str, max_chars: int = 1200, overlap: int = 200) -> List[str]:
+    """Split text into overlapping chunks of roughly max_chars."""
+    text = text.strip()
+    if not text:
+        return []
+    chunks = []
+    start = 0
+    L = len(text)
+    while start < L:
+        end = min(start + max_chars, L)
+        chunk = text[start:end].strip()
+        chunks.append(chunk)
+        if end == L:
+            break
+        start = max(0, end - overlap)
+    return chunks
 
 # =============================
-# Embeddings
+# Caching utilities (Streamlit)
 # =============================
-def embed_texts(texts: List[str]) -> np.ndarray:
-    embedder = get_embedder()
-    vectors = embedder.encode(texts, normalize_embeddings=True)
-    return vectors.astype(np.float32)
+@st.cache_resource(show_spinner=False)
+def get_vectorizer(max_features: int = 2000) -> TfidfVectorizer:
+    # small max_features keeps memory low on Streamlit Cloud
+    return TfidfVectorizer(stop_words="english", max_features=max_features)
 
-# =============================
-# Summarization (Optimized)
-# =============================
 @st.cache_data(show_spinner=False)
-def cached_summary(text: str, ratio: float):
-    summarizer = get_summarizer()
-    chunk_size = 3000  # large chunk size → fewer summarizer calls
+def compute_tfidf(corpus: List[str], max_features: int = 2000):
+    vec = get_vectorizer(max_features=max_features)
+    X = vec.fit_transform(corpus)
+    return vec, X
 
-    chunks = [text[i:i + chunk_size] for i in range(0, len(text), chunk_size)]
-    summary_parts = []
-
-    for ch in chunks:
-        out = summarizer(
-            ch,
-            max_length=400,
-            min_length=80,
-            do_sample=False
-        )
-        summary_parts.append(out[0]["summary_text"])
-
-    return " ".join(summary_parts)
-
-# =============================
-# Vector Store
-# =============================
-class VectorStore:
-    def __init__(self, dim: int):
-        self.dim = dim
-        self.ids = []
-        self.vectors = []
-        self.index = faiss.IndexFlatL2(dim) if HAVE_FAISS else None
-
-    def add(self, vectors: np.ndarray, ids: List[str]):
-        if vectors.ndim == 1:
-            vectors = vectors.reshape(1, -1)
-        if HAVE_FAISS and self.index is not None:
-            self.index.add(vectors)
-        self.vectors.extend([v for v in vectors])
-        self.ids.extend(ids)
-
-    def search(self, query_vec: np.ndarray, k: int = 5):
-        if query_vec.ndim == 1:
-            query_vec = query_vec.reshape(1, -1)
-
-        # FAISS search (faster)
-        if HAVE_FAISS and self.index is not None and len(self.ids) > 0:
-            D, I = self.index.search(query_vec, min(k, len(self.ids)))
-            return [
-                (self.ids[idx], float(dist))
-                for idx, dist in zip(I.ravel().tolist(), D.ravel().tolist())
-                if 0 <= idx < len(self.ids)
-            ]
-
-        # fallback cosine similarity
-        if not self.vectors:
-            return []
-
-        M = np.vstack(self.vectors)
-        q = query_vec[0]
-        sims = M @ q
-        dists = 1 - sims
-        order = np.argsort(dists)[:k]
-
-        return [(self.ids[i], float(dists[i])) for i in order]
+@st.cache_data(show_spinner=False)
+def lexrank_summary(text: str, sentences_count: int = 3) -> str:
+    try:
+        parser = PlaintextParser.from_string(text, Tokenizer("english"))
+        summarizer = LexRankSummarizer()
+        sentences = summarizer(parser.document, sentences_count)
+        return " ".join([str(s) for s in sentences])
+    except Exception:
+        # fallback: return first N sentences
+        sents = re.split(r'(?<=[.!?])\s+', text)
+        return " ".join(sents[:sentences_count])
 
 # =============================
-# Session State
+# Session-state storage
 # =============================
 if "docs" not in st.session_state:
-    st.session_state.docs = {}
+    # docs: {doc_name: {"text": str, "chunks": [str], "summary_short": str, "summary_long": str}}
+    st.session_state.docs: Dict[str, Dict] = {}
 
-if "store" not in st.session_state:
-    dim = get_embedder().get_sentence_embedding_dimension()
-    st.session_state.store = VectorStore(dim)
+if "chunks" not in st.session_state:
+    # chunks_list: list of chunk strings
+    st.session_state.chunks: List[str] = []
+    st.session_state.chunk_doc_map: List[str] = []  # map chunk idx -> doc name
+
+if "tfidf_matrix" not in st.session_state:
+    st.session_state.tfidf_matrix = None
+if "vectorizer" not in st.session_state:
+    st.session_state.vectorizer = None
 
 # =============================
-# UI – Upload Documents
+# UI: Upload + Process
 # =============================
-st.title("📄 AI-Powered Document Insight Generator")
+st.title("📄 Document Insight Generator — Free (No API keys)")
 
-uploads = st.file_uploader("Upload PDF or DOCX files", type=["pdf", "docx"], accept_multiple_files=True)
+st.info("This free version uses TF-IDF + extractive summarization (LexRank). No API keys required.")
+
+uploads = st.file_uploader(
+    "Upload PDF / DOCX files",
+    type=["pdf", "docx"],
+    accept_multiple_files=True,
+    key="uploader_free_v1"
+)
+
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB per file guard
 
 if uploads:
-    with st.spinner("Processing documents…"):
-        names, texts = [], []
-
+    with st.spinner("Processing uploaded documents..."):
+        new_chunks = []
+        new_map = []
         for uf in uploads:
+            name = uf.name
             try:
                 content = uf.read()
-
-                if uf.name.endswith(".pdf"):
-                    text = extract_text_from_pdf_bytes(content)
-                else:
-                    text = extract_text_from_docx(content)
-
-                if not text:
-                    st.warning(f"No text found in {uf.name}")
-                    continue
-
-                short_summary = cached_summary(text, ratio=0.1)
-                long_summary = cached_summary(text, ratio=1.0)
-
-                st.session_state.docs[uf.name] = {
-                    "text": text,
-                    "summary10": short_summary,
-                    "summary100": long_summary
-                }
-
-                names.append(uf.name)
-                texts.append(text)
-
             except Exception as e:
-                st.error(f"Error processing {uf.name}: {e}")
+                st.error(f"Could not read {name}: {e}")
+                continue
 
-        if texts:
-            vectors = embed_texts(texts)
-            st.session_state.store.add(vectors, names)
+            if len(content) > MAX_FILE_SIZE:
+                st.warning(f"{name} is larger than 10 MB — skipping for performance.")
+                continue
 
-    st.success("All documents processed successfully!")
+            if name.lower().endswith(".pdf"):
+                text = extract_text_from_pdf_bytes(content)
+            else:
+                text = extract_text_from_docx(content)
 
-st.divider()
+            if not text:
+                st.warning(f"No text extracted from {name}.")
+                continue
+
+            # chunk the text
+            chunks = chunk_text(text, max_chars=1200, overlap=200)
+            # compute summaries (short + long) using extractive summarizer
+            # sentences_count derived from text length
+            approx_sent_count = max(3, min(12, len(re.split(r'(?<=[.!?])\s+', text)) // 20))
+            short_sum = lexrank_summary(text, sentences_count=max(2, approx_sent_count // 3))
+            long_sum = lexrank_summary(text, sentences_count=max(5, approx_sent_count))
+
+            # store per-doc
+            st.session_state.docs[name] = {
+                "text": text,
+                "chunks": chunks,
+                "summary10": short_sum,
+                "summary100": long_sum
+            }
+
+            # append chunk-level index entries
+            for ch in chunks:
+                new_chunks.append(ch)
+                new_map.append(name)
+
+        # if new chunks exist, rebuild TF-IDF matrix across all chunks
+        if new_chunks:
+            st.session_state.chunks.extend(new_chunks)
+            st.session_state.chunk_doc_map.extend(new_map)
+            # compute TF-IDF for all chunks (keeps vectorizer cached)
+            vectorizer = get_vectorizer(max_features=3000)
+            tfidf_matrix = vectorizer.fit_transform(st.session_state.chunks)
+            st.session_state.tfidf_matrix = tfidf_matrix
+            st.session_state.vectorizer = vectorizer
+
+    st.success("Documents processed and indexed.")
+
+st.markdown("---")
 
 # =============================
-# Query Interface
+# Query interface
 # =============================
-st.subheader("🔍 Query Document Summaries")
-user_q = st.text_input("Enter keywords or a question")
+st.subheader("🔎 Search & Inspect Documents")
 
-if user_q:
-    qvec = embed_texts([user_q])
-    results = st.session_state.store.search(qvec)
+query = st.text_input("Enter a keyword, phrase, or question (e.g., 'revenue growth', 'risk factors')", key="query_input")
 
-    if results:
-        st.write("**Top Matches:**")
-        for doc_id, dist in results:
-            st.write(f"• {doc_id} — distance {dist:.4f}")
+top_k = st.slider("Number of top chunks to show", min_value=1, max_value=10, value=4)
 
-        best_doc = results[0][0]
-        data = st.session_state.docs[best_doc]
+if query:
+    if not st.session_state.chunks or st.session_state.tfidf_matrix is None:
+        st.info("No documents indexed yet. Upload files first.")
+    else:
+        with st.spinner("Searching..."):
+            # vectorize query and compute cosine similarity to chunk matrix
+            q_vec = st.session_state.vectorizer.transform([query])
+            sims = cosine_similarity(q_vec, st.session_state.tfidf_matrix).ravel()
+            top_idxs = np.argsort(sims)[::-1][:top_k]
+            results = [(int(i), float(sims[i]), st.session_state.chunk_doc_map[i], st.session_state.chunks[i]) for i in top_idxs if sims[i] > 0]
+        if not results:
+            st.info("No relevant matches found for that query.")
+        else:
+            st.write("**Top matches (chunk-level)**")
+            for idx, score, doc_name, chunk_text in results:
+                with st.expander(f"{doc_name} — relevance {score:.3f}"):
+                    st.write(chunk_text)
+                    st.download_button(f"Download chunk {idx}", data=chunk_text, file_name=f"{doc_name}_chunk_{idx}.txt", mime="text/plain")
 
-        st.subheader(f"📘 Best Match: {best_doc}")
+            # show best-matching document summary (aggregate)
+            best_doc = results[0][2]
+            st.subheader(f"📘 Best-matching document: {best_doc}")
+            doc_data = st.session_state.docs.get(best_doc, {})
+            st.markdown("**Short (extractive) summary:**")
+            st.write(doc_data.get("summary10", ""))
+            st.markdown("**Detailed (extractive) summary:**")
+            st.write(doc_data.get("summary100", ""))
 
-        keyword = user_q.lower()
-
-        def filter_summary(summary):
-            return " ".join([s for s in summary.split(". ") if keyword in s.lower()]) or summary
-
-        st.markdown("**Short Summary (10%)**")
-        st.text_area("", filter_summary(data["summary10"]), height=200)
-
-        st.markdown("**Detailed Summary (100%)**")
-        st.text_area("", filter_summary(data["summary100"]), height=300)
-
-st.divider()
+st.markdown("---")
 
 # =============================
-# Uploaded Documents Viewer
+# Uploaded Documents viewer
 # =============================
 if st.session_state.docs:
     st.subheader("📚 Uploaded Documents")
-    tabs = st.tabs(list(st.session_state.docs.keys()))
+    for name, meta in st.session_state.docs.items():
+        with st.expander(name):
+            st.markdown("**Short summary:**")
+            st.write(meta.get("summary10", ""))
+            st.markdown("**Detailed summary:**")
+            st.write(meta.get("summary100", ""))
+            st.markdown("**Extracted text (first 5000 chars):**")
+            st.text_area("", value=meta["text"][:5000], height=220)
+            st.download_button("⬇️ Download full extracted text", data=meta["text"], file_name=f"{name}_extracted.txt", mime="text/plain")
 
-    for tab, name in zip(tabs, st.session_state.docs.keys()):
-        with tab:
-            st.text_area("Full Extracted Text", st.session_state.docs[name]["text"], height=300)
-            st.download_button(
-                "⬇️ Download Extracted Text",
-                st.session_state.docs[name]["text"],
-                file_name=f"{name}_extracted.txt",
-                mime="text/plain"
-            )
-
-st.markdown("<br><br>", unsafe_allow_html=True)
-st.markdown("<div class='muted'>Developed by Aditya • Powered by AI</div>", unsafe_allow_html=True)
+st.markdown("<div class='muted'>Developed by Aditya — Free TF-IDF + LexRank version (no API keys)</div>", unsafe_allow_html=True)
